@@ -1,7 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1
-torchvision==0.20.1
-streamlit==1.37.1
+numpy==1.26.4
 pillow==10.4.0
 opencv-python-headless==4.10.0.84
-numpy==1.26.4
+streamlit==1.37.1
+
+# Install explicit CPU wheels for Python 3.12 on manylinux (works on Streamlit Cloud)
+torch @ https://download.pytorch.org/whl/cpu/torch-2.5.1%2Bcpu-cp312-cp312-manylinux2014_x86_64.whl
+torchvision @ https://download.pytorch.org/whl/cpu/torchvision-0.20.1%2Bcpu-cp312-cp312-manylinux2014_x86_64.whl
