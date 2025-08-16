@@ -55,6 +55,12 @@ def load_pil_from_bytes(data: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(data))
     return img.convert("RGB")
 
+def pil_to_png_bytes(pil: Image.Image) -> bytes:
+    """Render a PIL image to PNG bytes (most robust for st.image across environments)."""
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
+
 def preprocess(pil: Image.Image, size: int = IM_SIZE) -> Tuple[np.ndarray, Tuple[int, int]]:
     w, h = pil.size
     # Resize keeping aspect, then center-crop to size x size
@@ -200,9 +206,11 @@ if files:
         preview = None
         try:
             preview = load_pil_from_bytes(data)
+            # optional: downscale for display only
+            show_pil = preview.copy()
+            show_pil.thumbnail((1600, 1600))
             with preview_col:
-                # pass PIL directly to avoid dtype/shape surprises
-                st.image(preview, caption="Uploaded image", use_container_width=True)
+                st.image(pil_to_png_bytes(show_pil), caption="Uploaded image", use_container_width=True)
         except (UnidentifiedImageError, OSError):
             with preview_col:
                 st.info("Could not preview image; still attempting to run inference.")
@@ -228,9 +236,10 @@ if files:
             with st.spinner("Computing Grad-CAM style heatmap…"):
                 heat = occlusion_heatmap(sess, pil, occ_size=32, stride=16)
                 overlay = overlay_heatmap(pil, heat, alpha=0.45)
+                show_ov = overlay.copy()
+                show_ov.thumbnail((1600, 1600))
             with result_col:
-                # also pass PIL directly
-                st.image(overlay, caption="Grad-CAM overlay", use_container_width=True)
+                st.image(pil_to_png_bytes(show_ov), caption="Grad-CAM overlay", use_container_width=True)
         st.divider()
 else:
     st.info("Drag & drop chest X-ray images above to get predictions and heatmaps.")
