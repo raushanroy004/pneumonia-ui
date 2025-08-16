@@ -1,16 +1,16 @@
-# app.py — Streamlit ONNX pneumonia detector with occlusion heatmap (CPU-only)
+# app.py — Streamlit ONNX pneumonia detector (CPU-only) with occlusion heatmap
 from __future__ import annotations
 import io, json
 from pathlib import Path
-from typing import Tuple, List
+from typing import List, Tuple
 
 import numpy as np
-from PIL import Image, ImageOps, ImageFile
+from PIL import Image, ImageOps, ImageFile, UnidentifiedImageError
 import streamlit as st
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupted JPEGs
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # tolerate slightly corrupted jpgs
 
-# ------- Paths -------
+# ---------------- Paths ----------------
 BASE = Path(__file__).parent
 CANDIDATE_ONNX = [
     BASE / "pneumonia_densenet_model.onnx",
@@ -22,7 +22,7 @@ CANDIDATE_METRICS = [
     BASE / "pediatric_pneumonia_xray" / "outputs" / "test_metrics.json",
 ]
 
-# ------- Constants (match training) -------
+# ---------------- Constants (keep in sync with training) ----------------
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 DEFAULT_IMG_SIZE = 224
@@ -30,15 +30,16 @@ DEFAULT_THRESHOLD = 0.50
 POSITIVE_LABEL = "PNEUMONIA"
 NEGATIVE_LABEL = "NORMAL"
 
-# ------- Helpers -------
+# ---------------- Helpers ----------------
 def first_existing(paths: List[Path]) -> Path | None:
     for p in paths:
         if p.exists():
             return p
     return None
 
-def safe_open_image(uploaded_bytes: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(uploaded_bytes))
+def load_pil_from_bytes(data: bytes) -> Image.Image:
+    """Open bytes with PIL, fix EXIF orientation, ensure RGB."""
+    img = Image.open(io.BytesIO(data))
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
@@ -48,12 +49,13 @@ def safe_open_image(uploaded_bytes: bytes) -> Image.Image:
     return img
 
 def preprocess(pil: Image.Image, size: int = DEFAULT_IMG_SIZE) -> np.ndarray:
+    """PIL RGB -> normalized NCHW float32 for ONNX."""
     if pil.size != (size, size):
         pil = pil.resize((size, size))
-    x = np.asarray(pil).astype("float32") / 255.0
+    x = np.asarray(pil).astype("float32") / 255.0     # HWC
     x = (x - IMAGENET_MEAN) / IMAGENET_STD
-    x = np.transpose(x, (2, 0, 1))  # HWC->CHW
-    return x[np.newaxis, ...]       # NCHW
+    x = np.transpose(x, (2, 0, 1))                    # CHW
+    return x[np.newaxis, ...]                         # NCHW
 
 def sigmoid(z: float) -> float:
     return 1.0 / (1.0 + np.exp(-z))
@@ -69,7 +71,7 @@ def load_session_and_meta():
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
-    # infer input size if present
+    # Input size (fallback to 224 if dynamic)
     try:
         shp = session.get_inputs()[0].shape  # [N,3,H,W]
         h = int(shp[2]) if isinstance(shp[2], (int, np.integer)) else DEFAULT_IMG_SIZE
@@ -78,14 +80,14 @@ def load_session_and_meta():
     except Exception:
         img_size = DEFAULT_IMG_SIZE
 
-    # load best threshold if available
+    # Best threshold (optional metrics json)
     metrics_path = first_existing(CANDIDATE_METRICS)
     best_thr = DEFAULT_THRESHOLD
     if metrics_path is not None:
         try:
-            data = json.loads(metrics_path.read_text())
-            if "best_threshold" in data:
-                best_thr = float(data["best_threshold"])
+            j = json.loads(metrics_path.read_text())
+            if "best_threshold" in j:
+                best_thr = float(j["best_threshold"])
         except Exception:
             pass
 
@@ -112,7 +114,7 @@ def occlusion_heatmap(session, meta: dict, pil: Image.Image,
                       patch: int = 32, stride: int = 16, batch_size: int = 64) -> tuple[np.ndarray, np.ndarray]:
     """
     Gradient-free saliency: slide a gray patch; measure drop in P(pneumonia).
-    Returns heat (H,W) in [0,1] and RGB overlay (H,W,3) uint8.
+    Returns (heat_rgb, overlay_rgb) — both uint8 RGB for robust st.image().
     """
     size = meta["img_size"]
     pil_resized = pil.resize((size, size))
@@ -126,6 +128,7 @@ def occlusion_heatmap(session, meta: dict, pil: Image.Image,
     acc = np.zeros((H, W), dtype=np.float32)
     cnt = np.zeros((H, W), dtype=np.float32)
 
+    # Prepare occluded samples
     samples, coords = [], []
     for y in range(0, H, stride):
         for x in range(0, W, stride):
@@ -142,6 +145,7 @@ def occlusion_heatmap(session, meta: dict, pil: Image.Image,
         logits = np.ravel(out).astype("float32")
         return 1.0 / (1.0 + np.exp(-logits))
 
+    # Batched inference
     start = 0
     while start < len(samples):
         end = min(start + batch_size, len(samples))
@@ -154,23 +158,29 @@ def occlusion_heatmap(session, meta: dict, pil: Image.Image,
         start = end
 
     cnt[cnt == 0] = 1.0
-    heat = acc / cnt
+    heat = (acc / cnt)
     m = float(heat.max())
     if m > 1e-8:
         heat /= m
     heat = np.clip(heat, 0.0, 1.0)
 
+    # Make RGB images for older Streamlit (no clamp keyword needed)
     base = np.asarray(pil_resized).astype("float32")
+    # pure heat (grayscale -> RGB)
+    heat_u8 = (heat * 255).astype("uint8")
+    heat_rgb = np.stack([heat_u8, heat_u8, heat_u8], axis=-1)
+    # overlay (simple red overlay)
     red = np.zeros_like(base)
     red[..., 0] = 255.0 * heat
-    overlay = (0.6 * base + 0.4 * red).clip(0, 255).astype("uint8")
-    return heat, overlay
+    overlay = (0.60 * base + 0.40 * red).clip(0, 255).astype("uint8")
+    return heat_rgb, overlay.astype("uint8")
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="Pediatric Pneumonia Detector", page_icon="🫁")
 st.title("🫁 Pediatric Pneumonia Detector")
-st.caption("DenseNet121 exported to ONNX • CPU-only inference • Occlusion-based heatmap (Grad-CAM-style).")
+st.caption("DenseNet121 exported to ONNX • CPU-only inference • Occlusion-based heatmap.")
 
+# Load model
 try:
     session, meta = load_session_and_meta()
 except Exception as e:
@@ -187,59 +197,57 @@ with st.expander("Settings", expanded=False):
     thr_user = st.slider("Decision threshold (probability for PNEUMONIA)",
                          0.00, 1.00, float(meta["best_threshold"]), 0.01)
     st.markdown("---")
-    st.markdown("**Heatmap options** (occlusion method)")
+    st.markdown("**Heatmap options**")
     show_heat = st.checkbox("Show occlusion heatmap", value=True)
     patch = st.select_slider("Patch size (px)", options=[16, 24, 32, 40, 48, 56, 64], value=32)
     stride = st.select_slider("Stride (px)", options=[8, 12, 16, 20, 24, 28, 32], value=16)
 
 st.subheader("Upload chest X-ray")
-uploaded_files = st.file_uploader(
+files = st.file_uploader(
     "Upload one or more images (PNG/JPG/TIFF/BMP)…",
     type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
     accept_multiple_files=True
 )
 
-if not uploaded_files:
+if not files:
     st.info("Upload a PNG/JPG to get a prediction.")
     st.stop()
 
-for i, uf in enumerate(uploaded_files, start=1):
-    st.markdown(f"---\n**Image {i}:** `{uf.name}`")
-    raw = uf.getvalue()
-    if not raw:
+for i, f in enumerate(files, start=1):
+    st.markdown(f"---\n**Image {i}:** `{f.name}`")
+    data = f.getvalue()
+    if not data:
         st.error("Empty file. Please try another image.")
         continue
 
-    # Robust preview (PIL -> numpy)
+    # Preview (robust)
     try:
-        pil = safe_open_image(raw)
-        st.image(np.asarray(pil), caption="Uploaded image")
-    except Exception as e:
+        preview = load_pil_from_bytes(data)
+        show_pil = preview.copy()
+        show_pil.thumbnail((1600, 1600))
+        st.image(np.asarray(show_pil), caption="Uploaded image")
+    except (UnidentifiedImageError, OSError) as e:
         st.warning(f"Could not preview image ({e}); still running inference.")
         try:
-            pil = safe_open_image(raw)
+            preview = load_pil_from_bytes(data)
         except Exception as e2:
             st.error(f"Could not read image for inference: {e2}")
             continue
 
     # Predict
-    prob, label, used_thr = predict_one(session, meta, pil, threshold=thr_user)
+    prob, label, thr_used = predict_one(session, meta, preview, threshold=thr_user)
     c1, c2 = st.columns([1, 2])
     with c1:
         st.metric("Prediction", label)
     with c2:
         st.metric("Pneumonia probability", f"{prob:.3f}")
-    st.caption(f"Threshold = {used_thr:.2f}  •  Output = {label}")
+    st.caption(f"Threshold = {thr_used:.2f} • Output = {label}")
 
-    # Heatmap (optional)
+    # Heatmap
     if show_heat:
         with st.spinner("Computing heatmap…"):
-            heat, overlay = occlusion_heatmap(session, meta, pil, patch=patch, stride=stride, batch_size=64)
-
-        # convert heat (H,W) to RGB for older Streamlit versions
-        heat_rgb = (heat * 255).astype("uint8")
-        heat_rgb = np.stack([heat_rgb]*3, axis=-1)  # grayscale -> 3-channel
-
+            heat_rgb, overlay = occlusion_heatmap(session, meta, preview,
+                                                  patch=patch, stride=stride, batch_size=64)
         h1, h2 = st.columns(2)
         with h1:
             st.image(heat_rgb, caption="Occlusion heatmap")
