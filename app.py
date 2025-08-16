@@ -15,7 +15,7 @@ import onnxruntime as ort
 
 # ---------------- PATHS ----------------
 BASE = Path(__file__).parent
-ONNX_PATH = BASE / "pneumonia_densenet_model.onnx"   # <-- put your ONNX file here
+ONNX_PATH = BASE / "pneumonia_densenet_model.onnx"   # make sure the ONNX is here
 
 # ---------------- STREAMLIT SETUP ----------------
 st.set_page_config(
@@ -81,7 +81,7 @@ def prob_from_output(y: np.ndarray) -> float:
         return 1.0 / (1.0 + math.exp(-logit))
     if y.ndim == 2 and y.shape[1] == 2:
         row = y[0]
-        # If not a probability distribution, softmax it.
+        # If not already probs, softmax it.
         if not (0.0 <= row.min() and row.max() <= 1.0 and abs(row.sum() - 1.0) < 1e-4):
             m = row.max()
             e = np.exp(row - m)
@@ -106,8 +106,7 @@ def occlusion_heatmap(
     stride: int = 16,
 ) -> np.ndarray:
     """
-    Returns a [H,W] heatmap scaled 0..1 using occlusion sensitivity
-    (how much probability drops when a patch is covered).
+    Returns a [H,W] heatmap scaled 0..1 using occlusion sensitivity.
     Works with any black-box classifier (no gradients).
     """
     # Work on model input resolution
@@ -152,11 +151,10 @@ def occlusion_heatmap(
 
 def overlay_heatmap(pil_img: Image.Image, heat: np.ndarray, alpha: float = 0.45) -> Image.Image:
     """
-    Colorize heatmap (JET) and blend with the original image.
+    Colorize heatmap (JET-like) and blend with the original image.
     """
-    # Simple JET-like colormap without importing matplotlib
+    # Simple JET-like colormap without matplotlib
     def jet_colorize(h: np.ndarray) -> np.ndarray:
-        # h in [0,1]
         r = np.clip(1.5 - np.abs(4*h - 3), 0, 1)
         g = np.clip(1.5 - np.abs(4*h - 2), 0, 1)
         b = np.clip(1.5 - np.abs(4*h - 1), 0, 1)
@@ -203,7 +201,8 @@ if files:
         try:
             preview = load_pil_from_bytes(data)
             with preview_col:
-                st.image(np.asarray(preview), caption="Uploaded image", use_container_width=True)
+                # pass PIL directly to avoid dtype/shape surprises
+                st.image(preview, caption="Uploaded image", use_container_width=True)
         except (UnidentifiedImageError, OSError):
             with preview_col:
                 st.info("Could not preview image; still attempting to run inference.")
@@ -230,7 +229,8 @@ if files:
                 heat = occlusion_heatmap(sess, pil, occ_size=32, stride=16)
                 overlay = overlay_heatmap(pil, heat, alpha=0.45)
             with result_col:
-                st.image(np.asarray(overlay), caption="Grad-CAM overlay", use_container_width=True)
+                # also pass PIL directly
+                st.image(overlay, caption="Grad-CAM overlay", use_container_width=True)
         st.divider()
 else:
     st.info("Drag & drop chest X-ray images above to get predictions and heatmaps.")
