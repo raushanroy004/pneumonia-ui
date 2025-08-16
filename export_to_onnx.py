@@ -1,45 +1,87 @@
-# export_to_onnx.py  — one-time converter
-import torch
-import torch.nn as nn
-from torchvision import models
-from collections import OrderedDict
+# app.py — Streamlit UI using ONNX Runtime (no torch/torchvision on the server)
 from pathlib import Path
+import numpy as np
+from PIL import Image, UnidentifiedImageError
+import streamlit as st
+import onnxruntime as ort
 
-CKPT = Path("pneumonia_densenet_model.pth")
-OUT  = Path("pneumonia_densenet_model.onnx")
+# -------------------- PATHS --------------------
+BASE = Path(__file__).parent
+ONNX_MODEL = BASE / "pneumonia_densenet_model.onnx"   # commit this file to GitHub
 
-def build_model():
-    m = models.densenet121(weights=None)
-    in_f = m.classifier.in_features
-    m.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(in_f, 1))  # binary head like training
-    return m
+# -------------------- UI -----------------------
+st.set_page_config(page_title="🫁 Pediatric Pneumonia Detector", layout="centered")
+st.title("🫁 Pediatric Pneumonia Detector (ONNX)")
 
-def load_state_dict_robust(model, ckpt_path):
-    sd = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(sd, dict):
-        for k in ["state_dict", "model_state_dict", "model"]:
-            if k in sd and isinstance(sd[k], dict):
-                sd = sd[k]
-                break
-    new_sd = OrderedDict()
-    for k, v in sd.items():
-        if k.startswith("module."):  # strip DataParallel
-            new_sd[k[7:]] = v
-        else:
-            new_sd[k] = v
-    missing, unexpected = model.load_state_dict(new_sd, strict=False)
-    print("Loaded. Missing:", missing, "| Unexpected:", unexpected)
+with st.sidebar:
+    st.subheader("Settings")
+    thr = st.slider("Decision threshold", 0.05, 0.95, 0.50, 0.01)
+    st.caption("Prediction ≥ threshold → **PNEUMONIA**, otherwise **NORMAL**.")
 
-if __name__ == "__main__":
-    model = build_model()
-    load_state_dict_robust(model, CKPT)
-    model.eval()
+@st.cache_resource(show_spinner=False)
+def load_session(model_path: Path):
+    if not model_path.exists():
+        raise FileNotFoundError(f"ONNX model not found at:\n{model_path}")
+    sess = ort.InferenceSession(model_path.as_posix(), providers=["CPUExecutionProvider"])
+    in_name = sess.get_inputs()[0].name
+    out_name = sess.get_outputs()[0].name
+    return sess, in_name, out_name
 
-    dummy = torch.randn(1, 3, 224, 224)
-    torch.onnx.export(
-        model, dummy, OUT.as_posix(),
-        input_names=["input"], output_names=["logits"],
-        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=13
-    )
-    print("Wrote:", OUT.resolve())
+def _resize_center_crop(img: Image.Image, size=224):
+    # keep aspect, then center-crop to size x size
+    w, h = img.size
+    scale = size / min(w, h)
+    nw, nh = max(1, int(round(w*scale))), max(1, int(round(h*scale)))
+    img = img.resize((nw, nh), Image.BICUBIC)
+    left = (nw - size) // 2
+    top  = (nh - size) // 2
+    img = img.crop((left, top, left+size, top+size))
+    return img
+
+def preprocess(pil: Image.Image) -> np.ndarray:
+    """Match typical DenseNet/ImageNet preprocessing."""
+    pil = pil.convert("RGB")
+    pil = _resize_center_crop(pil, 224)
+    arr = np.asarray(pil).astype("float32") / 255.0  # HWC, 0..1
+    mean = np.array([0.485, 0.456, 0.406], dtype="float32")
+    std  = np.array([0.229, 0.224, 0.225], dtype="float32")
+    arr = (arr - mean) / std
+    arr = np.transpose(arr, (0, 1, 2))  # HWC (no-op but explicit)
+    arr = np.transpose(arr, (2, 0, 1))  # CHW
+    arr = arr[None, ...]                # NCHW
+    return arr
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+# -------------------- Load Model ----------------
+try:
+    sess, in_name, out_name = load_session(ONNX_MODEL)
+except Exception as e:
+    st.error(f"Failed to load ONNX model: {e}")
+    st.stop()
+
+# -------------------- Upload & Predict ----------
+st.write("Upload a single chest X-ray (JPG/PNG).")
+file = st.file_uploader("Image", type=["png", "jpg", "jpeg"])
+
+if file:
+    try:
+        pil = Image.open(file)
+    except UnidentifiedImageError:
+        st.error("Could not read image file. Please upload a valid PNG/JPG.")
+        st.stop()
+
+    st.image(pil, caption="Uploaded image", use_container_width=True)
+    with st.spinner("Running inference..."):
+        x = preprocess(pil)
+        logits = sess.run([out_name], {in_name: x})[0]  # shape (N,1) or (N,)
+        logit = float(np.array(logits).reshape(-1)[0])
+        prob = float(sigmoid(np.array([logit]))[0])
+
+    pred = "PNEUMONIA" if prob >= thr else "NORMAL"
+    st.success(f"**Prediction:** {pred}")
+    st.metric("Pneumonia probability", f"{prob*100:.1f}%")
+    st.caption(f"Threshold = {thr:.2f}")
+else:
+    st.info("Choose an image to get a prediction.")
