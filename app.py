@@ -1,245 +1,195 @@
-# app.py — Streamlit UI for Pediatric Pneumonia (ONNX + CPU-only)
-from __future__ import annotations
+# app.py — Streamlit ONNX pneumonia detector (CPU-only, no torch/torchvision)
 
+from __future__ import annotations
 import io
-import math
-import time
+import json
 from pathlib import Path
-from typing import Tuple
 
 import numpy as np
-from PIL import Image, UnidentifiedImageError
-
+from PIL import Image, ImageOps
 import streamlit as st
-import onnxruntime as ort
 
-# ---------------- PATHS ----------------
+# ========= Project paths (edit only if your files live elsewhere) =========
 BASE = Path(__file__).parent
-ONNX_PATH = BASE / "pneumonia_densenet_model.onnx"   # make sure the ONNX is here
 
-# ---------------- STREAMLIT SETUP ----------------
-st.set_page_config(
-    page_title="Pediatric Pneumonia Detector",
-    page_icon="🫁",
-    layout="wide",
-)
+# We try these paths in order to find your ONNX and metrics JSON
+CANDIDATE_ONNX = [
+    BASE / "pneumonia_densenet_model.onnx",
+    BASE / "pediatric_pneumonia_xray" / "pneumonia_densenet_model.onnx",
+]
+CANDIDATE_METRICS = [
+    BASE / "test_metrics.json",
+    BASE / "outputs" / "test_metrics.json",
+    BASE / "pediatric_pneumonia_xray" / "outputs" / "test_metrics.json",
+]
 
-def _pill(label: str, value: str, emoji: str = "🧠") -> None:
-    st.markdown(
-        f"""
-        <div style="
-            background: #1f2937; padding: 12px 14px; border-radius: 12px;
-            border: 1px solid #374151; color: #e5e7eb; font-size: 14px;">
-            <span style="opacity:.85">{emoji} {label}:</span>
-            <b style="margin-left: 6px">{value}</b>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ---------------- MODEL LOADING ----------------
-@st.cache_resource(show_spinner=True)
-def load_session() -> ort.InferenceSession:
-    providers = ["CPUExecutionProvider"]
-    so = ort.SessionOptions()
-    so.intra_op_num_threads = 1
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    return ort.InferenceSession(str(ONNX_PATH), sess_options=so, providers=providers)
-
-# ---------------- PRE/POST PROCESS ----------------
-IM_SIZE = 224
+# ========= Model/data constants (keep consistent with training) =========
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+DEFAULT_IMG_SIZE = 224
+DEFAULT_THRESHOLD = 0.50
+POSITIVE_LABEL = "PNEUMONIA"
+NEGATIVE_LABEL = "NORMAL"
 
-def load_pil_from_bytes(data: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(data))
-    return img.convert("RGB")
+# ========= Small helpers =========
+def first_existing(paths):
+    for p in paths:
+        if p.exists():
+            return p
+    return None
 
-def pil_to_png_bytes(pil: Image.Image) -> bytes:
-    """Render a PIL image to PNG bytes (most robust for st.image across environments)."""
-    buf = io.BytesIO()
-    pil.save(buf, format="PNG")
-    return buf.getvalue()
+def safe_open_image(uploaded_bytes: bytes) -> Image.Image:
+    """Open bytes with PIL, handle EXIF orientation and ensure RGB."""
+    img = Image.open(io.BytesIO(uploaded_bytes))
+    # Fix orientation if camera added EXIF rotation
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    return img
 
-def preprocess(pil: Image.Image, size: int = IM_SIZE) -> Tuple[np.ndarray, Tuple[int, int]]:
-    w, h = pil.size
-    # Resize keeping aspect, then center-crop to size x size
-    scale = max(size / h, size / w)
-    new_w, new_h = int(round(w * scale)), int(round(h * scale))
-    resized = pil.resize((new_w, new_h), Image.BICUBIC)
-    left = (new_w - size) // 2
-    top = (new_h - size) // 2
-    cropped = resized.crop((left, top, left + size, top + size))
-    arr = np.asarray(cropped).astype(np.float32) / 255.0
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
-    arr = np.transpose(arr, (2, 0, 1))[None, ...]  # NCHW
-    return arr.astype(np.float32), (w, h)
+def preprocess(pil: Image.Image, size: int = DEFAULT_IMG_SIZE) -> np.ndarray:
+    """PIL RGB -> normalized NCHW float32 (1,3,H,W) for ONNX runtime."""
+    if pil.size != (size, size):
+        pil = pil.resize((size, size))
+    x = np.asarray(pil).astype("float32") / 255.0           # HWC, [0,1]
+    x = (x - IMAGENET_MEAN) / IMAGENET_STD                  # normalize
+    x = np.transpose(x, (2, 0, 1))                          # HWC->CHW
+    x = x[np.newaxis, ...]                                  # add batch
+    return x
 
-def prob_from_output(y: np.ndarray) -> float:
-    """
-    Handles either:
-      - shape (1,1) logits
-      - shape (1,2) logits or probs with class order [normal, pneumonia]
-    """
-    y = np.array(y)
-    if y.ndim == 2 and y.shape[1] == 1:
-        logit = float(y[0, 0])
-        return 1.0 / (1.0 + math.exp(-logit))
-    if y.ndim == 2 and y.shape[1] == 2:
-        row = y[0]
-        # If not already probs, softmax it.
-        if not (0.0 <= row.min() and row.max() <= 1.0 and abs(row.sum() - 1.0) < 1e-4):
-            m = row.max()
-            e = np.exp(row - m)
-            row = e / e.sum()
-        return float(row[1])  # pneumonia class
-    # Fallback: squeeze -> sigmoid
-    logit = float(np.squeeze(y))
-    return 1.0 / (1.0 + math.exp(-logit))
+def sigmoid(z: float) -> float:
+    return 1.0 / (1.0 + np.exp(-z))
 
-def run_inference(sess: ort.InferenceSession, pil_img: Image.Image) -> float:
-    x, _ = preprocess(pil_img, IM_SIZE)
-    input_name = sess.get_inputs()[0].name
-    out = sess.run(None, {input_name: x})[0]
-    return prob_from_output(out)
+# ========= Load model + meta (cached) =========
+@st.cache_resource(show_spinner=True)
+def load_session_and_meta():
+    import onnxruntime as ort
 
-# ---------------- HEATMAP (black-box Grad-CAM style) ----------------
-def occlusion_heatmap(
-    sess: ort.InferenceSession,
-    pil_img: Image.Image,
-    base_color: Tuple[float, float, float] = (0.5, 0.5, 0.5),
-    occ_size: int = 32,
-    stride: int = 16,
-) -> np.ndarray:
-    """
-    Returns a [H,W] heatmap scaled 0..1 using occlusion sensitivity.
-    Works with any black-box classifier (no gradients).
-    """
-    # Work on model input resolution
-    w0, h0 = pil_img.size
-    pil = pil_img.resize((IM_SIZE, IM_SIZE), Image.BICUBIC)
-    base_prob = run_inference(sess, pil)
+    onnx_path = first_existing(CANDIDATE_ONNX)
+    if onnx_path is None:
+        raise FileNotFoundError(
+            "ONNX model not found. Expected at one of:\n" +
+            "\n".join([str(p) for p in CANDIDATE_ONNX])
+        )
 
-    # Normalized image 0..1 in HWC
-    img = np.asarray(pil).astype(np.float32) / 255.0
-    H, W, _ = img.shape
+    # ONNXRuntime CPU session
+    session = ort.InferenceSession(
+        str(onnx_path),
+        providers=["CPUExecutionProvider"]
+    )
 
-    heat = np.zeros((H, W), dtype=np.float32)
+    # Detect input size from model (fallback to 224)
+    try:
+        model_in = session.get_inputs()[0]
+        shape = model_in.shape  # e.g. [None, 3, 224, 224]
+        h = int(shape[2]) if isinstance(shape[2], (int, np.integer)) else DEFAULT_IMG_SIZE
+        w = int(shape[3]) if isinstance(shape[3], (int, np.integer)) else DEFAULT_IMG_SIZE
+        img_size = int(h) if h == w else DEFAULT_IMG_SIZE
+    except Exception:
+        img_size = DEFAULT_IMG_SIZE
 
-    # Precompute mask patch
-    patch = np.ones((occ_size, occ_size, 3), dtype=np.float32)
-    patch[:] = np.array(base_color, dtype=np.float32)
+    # Load best threshold if metrics exists
+    metrics_path = first_existing(CANDIDATE_METRICS)
+    best_thr = DEFAULT_THRESHOLD
+    if metrics_path is not None:
+        try:
+            data = json.loads(metrics_path.read_text())
+            if "best_threshold" in data:
+                best_thr = float(data["best_threshold"])
+        except Exception:
+            pass
 
-    # Iterate windows
-    for y in range(0, H - occ_size + 1, stride):
-        for x in range(0, W - occ_size + 1, stride):
-            tmp = img.copy()
-            tmp[y:y + occ_size, x:x + occ_size, :] = patch
-            # Normalize + NCHW
-            arr = (tmp - IMAGENET_MEAN) / IMAGENET_STD
-            arr = np.transpose(arr, (2, 0, 1))[None, ...].astype(np.float32)
-            prob = prob_from_output(
-                sess.run(None, {sess.get_inputs()[0].name: arr})[0]
-            )
-            drop = max(0.0, base_prob - prob)  # only positive importance
-            heat[y:y + occ_size, x:x + occ_size] += drop
+    input_name = session.get_inputs()[0].name
+    output_name = session.get_outputs()[0].name
 
-    # Normalize heat
-    hmin, hmax = float(heat.min()), float(heat.max())
-    if hmax > hmin:
-        heat = (heat - hmin) / (hmax - hmin)
-    else:
-        heat[:] = 0.0
+    meta = {
+        "onnx_path": onnx_path,
+        "img_size": img_size,
+        "best_threshold": best_thr,
+        "input_name": input_name,
+        "output_name": output_name,
+        "metrics_path": metrics_path,
+    }
+    return session, meta
 
-    # Upscale back to original image size
-    heat_img = Image.fromarray(np.uint8(heat * 255), mode="L").resize((w0, h0), Image.BICUBIC)
-    return np.asarray(heat_img).astype(np.float32) / 255.0
+def predict_one(session, meta: dict, pil: Image.Image, threshold: float | None = None):
+    """Returns (prob_pneumonia, label_str, used_threshold)"""
+    x = preprocess(pil, size=meta["img_size"])
+    out = session.run([meta["output_name"]], {meta["input_name"]: x})[0]
+    logit = float(np.ravel(out)[0])
+    prob = sigmoid(logit)
+    thr = float(meta["best_threshold"] if threshold is None else threshold)
+    label = POSITIVE_LABEL if prob >= thr else NEGATIVE_LABEL
+    return prob, label, thr
 
-def overlay_heatmap(pil_img: Image.Image, heat: np.ndarray, alpha: float = 0.45) -> Image.Image:
-    """
-    Colorize heatmap (JET-like) and blend with the original image.
-    """
-    # Simple JET-like colormap without matplotlib
-    def jet_colorize(h: np.ndarray) -> np.ndarray:
-        r = np.clip(1.5 - np.abs(4*h - 3), 0, 1)
-        g = np.clip(1.5 - np.abs(4*h - 2), 0, 1)
-        b = np.clip(1.5 - np.abs(4*h - 1), 0, 1)
-        return np.stack([r, g, b], axis=-1)
+# ============================== UI ==============================
+st.set_page_config(page_title="Pediatric Pneumonia Detector", page_icon="🫁", layout="centered")
 
-    img = np.asarray(pil_img.convert("RGB")).astype(np.float32) / 255.0
-    color = jet_colorize(heat)
-    overlay = (1 - alpha) * img + alpha * color
-    overlay = np.clip(overlay, 0, 1)
-    return Image.fromarray((overlay * 255).astype(np.uint8), mode="RGB")
-
-# ---------------- UI ----------------
-st.markdown("<h1>🫁 Pediatric Pneumonia Detector</h1>", unsafe_allow_html=True)
+st.title("🫁 Pediatric Pneumonia Detector")
 st.caption("DenseNet121 (exported to ONNX). CPU-only inference.")
 
-with st.sidebar:
-    _pill("Backbone", "DenseNet121 (ONNX)")
-    use_tuned = st.toggle("Use tuned threshold", value=True)
-    thr = 0.50 if use_tuned else st.slider("Classification threshold", 0.05, 0.95, 0.50, 0.01)
-    show_cam = st.toggle("Show Grad-CAM", value=True)
-
-st.subheader("Upload a chest X-ray")
-files = st.file_uploader(
-    "Upload one or more images (PNG/JPG/TIFF/BMP)…",
-    type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
-    accept_multiple_files=True,
-)
-
-# Load model session once
-if not ONNX_PATH.exists():
-    st.error(f"ONNX model not found: {ONNX_PATH}")
+# Load model + meta once
+try:
+    session, meta = load_session_and_meta()
+except Exception as e:
+    st.error(f"Failed to load ONNX model: {e}")
     st.stop()
 
-sess = load_session()
+with st.expander("Settings", expanded=False):
+    st.write("**Model file:**", meta["onnx_path"].name)
+    st.write("**Input size:**", f"{meta['img_size']}×{meta['img_size']}")
+    if meta["metrics_path"] is not None:
+        st.write("**Metrics file:**", meta["metrics_path"].name)
+    else:
+        st.write("**Metrics file:** not found (using threshold 0.50)")
+    thr_user = st.slider(
+        "Decision threshold (probability for PNEUMONIA)",
+        min_value=0.00, max_value=1.00, value=float(meta["best_threshold"]), step=0.01
+    )
 
-if files:
-    for idx, uf in enumerate(files, 1):
-        st.markdown(f"### Image {idx}: {uf.name}")
-        data = uf.getvalue()  # read bytes once
+st.subheader("Upload chest X-ray")
+uploaded_files = st.file_uploader(
+    "Upload one or more images (PNG/JPG/TIFF/BMP)…",
+    type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+    accept_multiple_files=True
+)
 
-        # --- Preview (robust) ---
-        preview_col, result_col = st.columns([1.1, 1.3])
-        preview = None
-        try:
-            preview = load_pil_from_bytes(data)
-            # optional: downscale for display only
-            show_pil = preview.copy()
-            show_pil.thumbnail((1600, 1600))
-            with preview_col:
-                st.image(pil_to_png_bytes(show_pil), caption="Uploaded image", use_container_width=True)
-        except (UnidentifiedImageError, OSError):
-            with preview_col:
-                st.info("Could not preview image; still attempting to run inference.")
+if not uploaded_files:
+    st.info("Upload a PNG/JPG to get a prediction.")
+    st.stop()
 
-        # --- Inference ---
-        try:
-            pil = preview if preview is not None else load_pil_from_bytes(data)
-        except Exception as e:
-            st.error(f"Failed to read image for inference: {e}")
-            continue
+for i, uf in enumerate(uploaded_files, start=1):
+    st.markdown(f"---\n**Image {i}:** `{uf.name}`")
 
-        with st.spinner("Running inference…"):
-            t0 = time.time()
-            prob = run_inference(sess, pil)
-            elapsed = time.time() - t0
+    # Always use original bytes for display (more robust on Streamlit Cloud)
+    raw_bytes = uf.getvalue()
+    if not raw_bytes:
+        st.error("Empty file. Please try another image.")
+        continue
 
-        label = "PNEUMONIA" if prob >= thr else "NORMAL"
-        box = st.success if label == "PNEUMONIA" else st.info
-        box(f"**Prediction:** {label}  |  **Probability (Pneumonia):** {prob:.3f}  |  **Threshold:** {thr:.2f}  ·  _{elapsed*1000:.0f} ms_")
+    # Show preview using bytes (avoids dtype/shape issues)
+    try:
+        st.image(raw_bytes, caption="Uploaded image", use_container_width=True)
+    except Exception:
+        st.warning("Could not preview image; still attempting to run inference.")
 
-        # --- Heatmap / Grad-CAM style ---
-        if show_cam:
-            with st.spinner("Computing Grad-CAM style heatmap…"):
-                heat = occlusion_heatmap(sess, pil, occ_size=32, stride=16)
-                overlay = overlay_heatmap(pil, heat, alpha=0.45)
-                show_ov = overlay.copy()
-                show_ov.thumbnail((1600, 1600))
-            with result_col:
-                st.image(pil_to_png_bytes(show_ov), caption="Grad-CAM overlay", use_container_width=True)
-        st.divider()
-else:
-    st.info("Drag & drop chest X-ray images above to get predictions and heatmaps.")
+    # Predict with PIL pipeline
+    try:
+        pil = safe_open_image(raw_bytes)
+    except Exception as e:
+        st.error(f"Could not read image: {e}")
+        continue
+
+    prob, label, used_thr = predict_one(session, meta, pil, threshold=thr_user)
+
+    cols = st.columns([1, 2])
+    with cols[0]:
+        st.metric("Prediction", label)
+    with cols[1]:
+        st.metric("Pneumonia probability", f"{prob:.3f}")
+    st.caption(f"Threshold = {used_thr:.2f}  •  Output = {label}")
+
+st.success("Done.")
