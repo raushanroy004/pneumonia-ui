@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from torchvision import models
+import streamlit as st, torch, torchvision
+st.sidebar.write("Torch:", torch.__version__, "| TV:", torchvision.__version__)
+
 
 # ---------- PATHS (match your screenshots) ----------
 # Your model file sits directly inside: C:\Users\itsra\PneumoniaUI\pediatric_pneumonia_xray\
