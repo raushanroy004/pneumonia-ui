@@ -1,4 +1,4 @@
-# app.py — Streamlit ONNX pneumonia detector (CPU-only, no torch/torchvision needed)
+# app.py — Streamlit ONNX pneumonia detector (CPU-only, no torch/torchvision)
 
 from __future__ import annotations
 import io
@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import streamlit as st
 
 # ========= Project paths (edit only if your files live elsewhere) =========
@@ -24,23 +24,28 @@ CANDIDATE_METRICS = [
 ]
 
 # ========= Model/data constants (keep consistent with training) =========
-# If your training used other stats/size, change here:
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-DEFAULT_IMG_SIZE = 224         # your export likely used 224
-DEFAULT_THRESHOLD = 0.50       # will be overridden by metrics.json if present
-POSITIVE_LABEL = "PNEUMONIA"   # positive class name
+DEFAULT_IMG_SIZE = 224
+DEFAULT_THRESHOLD = 0.50
+POSITIVE_LABEL = "PNEUMONIA"
 NEGATIVE_LABEL = "NORMAL"
 
 # ========= Small helpers =========
-def first_existing(paths: list[Path]) -> Path | None:
+def first_existing(paths):
     for p in paths:
         if p.exists():
             return p
     return None
 
 def safe_open_image(uploaded_bytes: bytes) -> Image.Image:
+    """Open bytes with PIL, handle EXIF orientation and ensure RGB."""
     img = Image.open(io.BytesIO(uploaded_bytes))
+    # Fix orientation if camera added EXIF rotation
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
     if img.mode != "RGB":
         img = img.convert("RGB")
     return img
@@ -76,17 +81,17 @@ def load_session_and_meta():
         providers=["CPUExecutionProvider"]
     )
 
-    # Determine input spatial size from the model if given (fallback to 224)
+    # Detect input size from model (fallback to 224)
     try:
         model_in = session.get_inputs()[0]
-        shape = model_in.shape  # e.g., ['N', 3, 224, 224] or [None, 3, None, None]
+        shape = model_in.shape  # e.g. [None, 3, 224, 224]
         h = int(shape[2]) if isinstance(shape[2], (int, np.integer)) else DEFAULT_IMG_SIZE
         w = int(shape[3]) if isinstance(shape[3], (int, np.integer)) else DEFAULT_IMG_SIZE
         img_size = int(h) if h == w else DEFAULT_IMG_SIZE
     except Exception:
         img_size = DEFAULT_IMG_SIZE
 
-    # Best threshold from metrics (optional)
+    # Load best threshold if metrics exists
     metrics_path = first_existing(CANDIDATE_METRICS)
     best_thr = DEFAULT_THRESHOLD
     if metrics_path is not None:
@@ -97,7 +102,6 @@ def load_session_and_meta():
         except Exception:
             pass
 
-    # IO names
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
 
@@ -112,7 +116,7 @@ def load_session_and_meta():
     return session, meta
 
 def predict_one(session, meta: dict, pil: Image.Image, threshold: float | None = None):
-    """Returns (prob_pneumonia, label_str)"""
+    """Returns (prob_pneumonia, label_str, used_threshold)"""
     x = preprocess(pil, size=meta["img_size"])
     out = session.run([meta["output_name"]], {meta["input_name"]: x})[0]
     logit = float(np.ravel(out)[0])
@@ -141,8 +145,6 @@ with st.expander("Settings", expanded=False):
         st.write("**Metrics file:**", meta["metrics_path"].name)
     else:
         st.write("**Metrics file:** not found (using threshold 0.50)")
-
-    # Let user override threshold
     thr_user = st.slider(
         "Decision threshold (probability for PNEUMONIA)",
         min_value=0.00, max_value=1.00, value=float(meta["best_threshold"]), step=0.01
@@ -159,29 +161,30 @@ if not uploaded_files:
     st.info("Upload a PNG/JPG to get a prediction.")
     st.stop()
 
-# Process each file
 for i, uf in enumerate(uploaded_files, start=1):
     st.markdown(f"---\n**Image {i}:** `{uf.name}`")
-    data = uf.read()
-    if not data:
+
+    # Always use original bytes for display (more robust on Streamlit Cloud)
+    raw_bytes = uf.getvalue()
+    if not raw_bytes:
         st.error("Empty file. Please try another image.")
         continue
 
-    # Validate and preview
+    # Show preview using bytes (avoids dtype/shape issues)
     try:
-        pil = safe_open_image(data)
+        st.image(raw_bytes, caption="Uploaded image", use_container_width=True)
+    except Exception:
+        st.warning("Could not preview image; still attempting to run inference.")
+
+    # Predict with PIL pipeline
+    try:
+        pil = safe_open_image(raw_bytes)
     except Exception as e:
         st.error(f"Could not read image: {e}")
         continue
 
-    # Preview (convert to uint8 numpy to avoid mode issues)
-    preview = np.asarray(pil).astype("uint8")
-    st.image(preview, caption="Uploaded image", use_container_width=True)
-
-    # Predict
     prob, label, used_thr = predict_one(session, meta, pil, threshold=thr_user)
 
-    # Display result
     cols = st.columns([1, 2])
     with cols[0]:
         st.metric("Prediction", label)
