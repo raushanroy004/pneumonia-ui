@@ -1,45 +1,32 @@
-# export_to_onnx.py  — one-time converter
-import torch
-import torch.nn as nn
+# export_to_onnx.py  — one-time local converter
+import torch, torch.nn as nn
 from torchvision import models
 from collections import OrderedDict
 from pathlib import Path
 
-CKPT = Path("pneumonia_densenet_model.pth")
-OUT  = Path("pneumonia_densenet_model.onnx")
+CKPT = Path("pneumonia_densenet_model.pth")   # <-- your .pth filename here
+OUT  = Path("pneumonia_densenet_model.onnx")  # this will be created
 
 def build_model():
     m = models.densenet121(weights=None)
     in_f = m.classifier.in_features
-    m.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(in_f, 1))  # binary head like training
+    m.classifier = nn.Sequential(nn.Dropout(0.5), nn.Linear(in_f, 1))
     return m
 
-def load_state_dict_robust(model, ckpt_path):
-    sd = torch.load(ckpt_path, map_location="cpu")
+def load_sd(model, ckpt):
+    sd = torch.load(ckpt, map_location="cpu")
     if isinstance(sd, dict):
-        for k in ["state_dict", "model_state_dict", "model"]:
+        for k in ("state_dict","model_state_dict","model"):
             if k in sd and isinstance(sd[k], dict):
-                sd = sd[k]
-                break
-    new_sd = OrderedDict()
-    for k, v in sd.items():
-        if k.startswith("module."):  # strip DataParallel
-            new_sd[k[7:]] = v
-        else:
-            new_sd[k] = v
-    missing, unexpected = model.load_state_dict(new_sd, strict=False)
-    print("Loaded. Missing:", missing, "| Unexpected:", unexpected)
+                sd = sd[k]; break
+    new = OrderedDict((k[7:], v) if k.startswith("module.") else (k, v) for k, v in sd.items())
+    model.load_state_dict(new, strict=False)
 
 if __name__ == "__main__":
-    model = build_model()
-    load_state_dict_robust(model, CKPT)
-    model.eval()
-
-    dummy = torch.randn(1, 3, 224, 224)
-    torch.onnx.export(
-        model, dummy, OUT.as_posix(),
-        input_names=["input"], output_names=["logits"],
-        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
-        opset_version=13
-    )
+    m = build_model(); load_sd(m, CKPT); m.eval()
+    dummy = torch.randn(1,3,224,224)
+    torch.onnx.export(m, dummy, OUT.as_posix(),
+                      input_names=["input"], output_names=["logits"],
+                      dynamic_axes={"input":{0:"batch"},"logits":{0:"batch"}},
+                      opset_version=13)
     print("Wrote:", OUT.resolve())
