@@ -266,7 +266,7 @@ def overlay_heatmap(pil: Image.Image, heat: np.ndarray, alpha: float=0.45) -> Im
 st.set_page_config(page_title="Pediatric Pneumonia Detector", page_icon="🫁")
 
 st.title("🫁 Pediatric Pneumonia Detector")
-st.caption("DenseNet121 exported to ONNX • CPU-only • Fast, interpretable explanations.")
+st.caption("Developed by: AI-GIC(Artificial Intelligence - Global Innovation Center), NIST University")
 
 # Load model/session
 try:
