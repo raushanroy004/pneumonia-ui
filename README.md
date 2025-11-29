@@ -1,5 +1,7 @@
 🩺 Paediatric Pneumonia Detector (Chest X-Ray · DenseNet121)
 
+▶️ Live Demo:- (https://pneumonia-ui-fnrwuargjgvswidka9jbyd.streamlit.app/)
+
 A deep-learning powered diagnostic tool built using DenseNet121 to classify pediatric chest X-rays as Normal or Pneumonia, with Grad-CAM heatmap explainability and a clean Streamlit UI for real-time medical assistance.
 This project aims to support radiologists with faster, more reliable, and interpretable diagnosis.
 
@@ -45,30 +47,21 @@ Explainability: Grad-CAM highlights affected lung regions
 
 Output: Final label (Normal/Pneumonia) + heatmap overlay
 
-<br>
 
-(See workflow diagram in the project PDF 
 
-Paediatric Pneumonia Detector (…
-
-)
+Paediatric Pneumonia Detector 
 
 📊 Results:
 
 AUC Score: 99.8%
 
-Strong performance on test dataset (Confusion Matrix on page 10) 
+Strong performance on test dataset 
 
-Paediatric Pneumonia Detector (…
+Paediatric Pneumonia Detector
 
-Grad-CAM shows medically meaningful regions, proving reliable decision-making (page 11) 
+Grad-CAM shows medically meaningful regions, 
 
-Paediatric Pneumonia Detector (…
-
-🌐 Live Demo
-
-🔗 Streamlit App:
-https://pneumonia-ui-fnrwuargjgvswidka9jbyd.streamlit.app/
+Paediatric Pneumonia Detector
 
 📁 Dataset
 
